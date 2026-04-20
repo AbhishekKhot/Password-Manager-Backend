@@ -1,63 +1,34 @@
 import type { FastifyInstance } from "fastify";
 import { AppDataSource } from "../index.js";
 import { VaultItem } from "../entities/VaultItem.js";
+import { VaultService } from "../services/vault.service.js";
+import { createVaultController } from "../controllers/vault.controller.js";
 
+/**
+ * Vault routes — URL-to-controller wiring, JWT-gated.
+ *
+ * Layering: routes → controllers → services → entities.
+ *
+ * Design pattern: Composition Root.
+ *   Services/controllers are constructed here once at plugin boot and
+ *   passed to Fastify by reference. No globals, no DI container — just
+ *   explicit wiring suitable for a small, focused codebase.
+ *
+ * Auth gating:
+ *   Every route runs `fastify.authenticate` as an `onRequest` hook. That
+ *   decorator is defined in [index.ts](../index.ts) and verifies the JWT
+ *   access-token cookie, populating `request.user`. A failure there
+ *   short-circuits to 401 before the controller runs.
+ */
 export default async function vaultRoutes(fastify: FastifyInstance) {
     const vaultRepository = AppDataSource.getRepository(VaultItem);
+    const service = new VaultService(vaultRepository);
+    const controller = createVaultController(service);
 
-    // Get all vault items for the authenticated user
-    fastify.get("/vault", { onRequest: [fastify.authenticate] }, async (request, reply) => {
-        const user_id = request.user.id;
-        const items = await vaultRepository.find({ where: { user_id } });
-        return items;
-    });
+    const auth = { onRequest: [fastify.authenticate] };
 
-    // Create a new vault item
-    fastify.post("/vault", { onRequest: [fastify.authenticate] }, async (request, reply) => {
-        const user_id = request.user.id;
-        const { iv, encrypted_data } = request.body as any;
-
-        if (!iv || !encrypted_data) {
-            return reply.status(400).send({ error: "Missing iv or encrypted_data" });
-        }
-
-        const item = vaultRepository.create({ user_id, iv, encrypted_data });
-        await vaultRepository.save(item);
-
-        return reply.status(201).send(item);
-    });
-
-    // Update an existing vault item
-    fastify.put("/vault/:id", { onRequest: [fastify.authenticate] }, async (request, reply) => {
-        const user_id = request.user.id;
-        const { id } = request.params as { id: string };
-        const { iv, encrypted_data } = request.body as any;
-
-        const item = await vaultRepository.findOne({ where: { id, user_id } });
-
-        if (!item) {
-            return reply.status(404).send({ error: "Vault item not found" });
-        }
-
-        if (iv) item.iv = iv;
-        if (encrypted_data) item.encrypted_data = encrypted_data;
-
-        await vaultRepository.save(item);
-        return item;
-    });
-
-    // Delete a vault item
-    fastify.delete("/vault/:id", { onRequest: [fastify.authenticate] }, async (request, reply) => {
-        const user_id = request.user.id;
-        const { id } = request.params as { id: string };
-
-        const item = await vaultRepository.findOne({ where: { id, user_id } });
-
-        if (!item) {
-            return reply.status(404).send({ error: "Vault item not found" });
-        }
-
-        await vaultRepository.remove(item);
-        return { message: "Vault item deleted" };
-    });
+    fastify.get("/vault", auth, controller.list);
+    fastify.post("/vault", auth, controller.create);
+    fastify.put("/vault/:id", auth, controller.update);
+    fastify.delete("/vault/:id", auth, controller.remove);
 }

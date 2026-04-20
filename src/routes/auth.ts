@@ -1,49 +1,48 @@
 import type { FastifyInstance } from "fastify";
 import { AppDataSource } from "../index.js";
 import { User } from "../entities/User.js";
+import { RefreshToken } from "../entities/RefreshToken.js";
+import { AuthService } from "../services/auth.service.js";
+import { createTokenService } from "../services/token.service.js";
+import { createAuthController } from "../controllers/auth.controller.js";
 
+/**
+ * Auth routes — URL-to-controller wiring.
+ *
+ * ── Layering (top → bottom of the call stack) ─────────────────────────────
+ *   routes/      — Fastify URL wiring + auth-plugin registration (this file).
+ *   controllers/ — HTTP adapter: parses input, calls service, shapes reply.
+ *   services/    — business logic, zero HTTP knowledge.
+ *   entities/    — ORM mapping.
+ *
+ * ── Design pattern: Composition Root ──────────────────────────────────────
+ * This function is where services and controllers are *constructed and
+ * wired together*, once, at process start. Elsewhere, the controller is
+ * handed to the route by reference. Keeping construction here (rather
+ * than using a DI container) is the simplest working option for a small
+ * codebase — see Mark Seemann's "Composition Root" concept.
+ *
+ * Note on the purge sweep at the bottom:
+ *   We run `tokens.purgeExpired()` at plugin boot to trim old refresh
+ *   rows. `.catch(() => undefined)` keeps a transient DB hiccup from
+ *   blocking server startup.
+ */
 export default async function authRoutes(fastify: FastifyInstance) {
+    // Build the composition graph: repos → services → controller.
     const userRepository = AppDataSource.getRepository(User);
+    const refreshRepository = AppDataSource.getRepository(RefreshToken);
 
-    fastify.get("/auth/salt", async (request, reply) => {
-        const { email } = request.query as { email: string }
+    const tokens = createTokenService(fastify, refreshRepository);
+    const service = new AuthService(userRepository, tokens);
+    const controller = createAuthController(service);
 
-        const user = await userRepository.findOneBy({ email });
+    // Thin route wiring — no logic here beyond URL → handler.
+    fastify.get("/auth/salt", controller.salt);
+    fastify.post("/auth/register", controller.register);
+    fastify.post("/auth/login", controller.login);
+    fastify.post("/auth/refresh", controller.refresh);
+    fastify.post("/auth/logout", controller.logout);
 
-        if (!user) {
-            return reply.status(404).send({ error: "User not found" })
-        }
-
-        return { salt: user.kdf_salt }
-    });
-
-    fastify.post("/auth/register", async (request, reply) => {
-        const { email, auth_hash, kdf_salt } = request.body as any;
-
-        const existing = await userRepository.findOneBy({ email });
-
-        if (existing) {
-            return reply.status(400).send({ error: "Email already exists" });
-        }
-
-        const user = userRepository.create({ email, auth_hash, kdf_salt });
-
-        await userRepository.save(user);
-
-        return reply.status(201).send({ message: "Registraction successful" });
-    });
-
-    fastify.post("/auth/login", async (request, reply) => {
-        const { email, auth_hash } = request.body as any;
-
-        const user = await userRepository.findOneBy({ email });
-
-        if (!user || user.auth_hash !== auth_hash) {
-            return reply.status(401).send({ error: "Invalid credentials" });
-        }
-
-        const token = fastify.jwt.sign({ id: user.id, email: user.email }, { expiresIn: '1h' });
-
-        return { token, message: "Login successful" }
-    });
+    // Opportunistic cleanup of expired refresh tokens on plugin boot.
+    await tokens.purgeExpired();
 }
