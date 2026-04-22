@@ -9,14 +9,15 @@ import cookie from "@fastify/cookie";
 import helmet from "@fastify/helmet";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
-import { DataSource } from "typeorm";
 import { config } from "./config.js";
-import { User } from "./entities/User.js";
-import { VaultItem } from "./entities/VaultItem.js";
-import { RefreshToken } from "./entities/RefreshToken.js";
+import { AppDataSource } from "./data-source.js";
 import authRoutes from "./routes/auth.js";
 import vaultRoutes from "./routes/vault.js";
 import { AppError, ValidationError } from "./errors/AppError.js";
+
+// Re-exported so existing route modules that import `AppDataSource` from
+// "../index.js" keep working without churn.
+export { AppDataSource } from "./data-source.js";
 
 /**
  * Fastify application instance.
@@ -117,29 +118,6 @@ await fastify.register(rateLimit, {
     timeWindow: "1 minute",
 });
 
-/**
- * TypeORM DataSource.
- *
- * `synchronize: false` is critical — TypeORM's autosync can drop or alter
- * columns it doesn't recognise. We use hand-rolled SQL migrations
- * (see migrate.ts + migrations/*.sql) so schema changes are explicit,
- * code-reviewable, and reversible.
- *
- * `extra.max` caps the PG connection pool. Exceeding Postgres's max_connections
- * under load causes "too many clients already" — pool size × replicas must
- * stay below the DB's limit.
- */
-export const AppDataSource = new DataSource({
-    type: "postgres",
-    url: config.DATABASE_URL,
-    synchronize: false,
-    logging: config.NODE_ENV === "development" ? true : ["error", "warn"],
-    entities: [User, VaultItem, RefreshToken],
-    extra: {
-        max: config.DB_POOL_MAX,
-    },
-});
-
 // JWT verification reads the `access_token` cookie instead of the Authorization
 // header. Cookies are httpOnly, so JavaScript on the page (including any XSS)
 // cannot read the token — it's only sent by the browser on same-site requests.
@@ -235,7 +213,10 @@ await fastify.register(vaultRoutes);
  * Order matters:
  *   1. Connect to Postgres first. If the DB is down the process should not
  *      begin accepting HTTP traffic — readiness would fail immediately.
- *   2. Only then call `fastify.listen` so requests never hit a half-initialised
+ *   2. Run pending TypeORM migrations. Every deploy brings the schema up to
+ *      date before the first request lands; new servers in an autoscaling
+ *      group converge on the same schema without an out-of-band step.
+ *   3. Only then call `fastify.listen` so requests never hit a half-initialised
  *      server.
  *
  * Any failure during boot → exit code 1 so the orchestrator restarts us
@@ -245,6 +226,12 @@ const start = async () => {
     try {
         await AppDataSource.initialize();
         console.log("Database connection established");
+        const applied = await AppDataSource.runMigrations({ transaction: "each" });
+        if (applied.length > 0) {
+            console.log(`Applied ${applied.length} migration(s): ${applied.map((m) => m.name).join(", ")}`);
+        } else {
+            console.log("Migrations up-to-date");
+        }
         await fastify.listen({ port: config.PORT, host: "0.0.0.0" });
         console.log(`Server listening at http://localhost:${config.PORT}`);
     } catch (error) {

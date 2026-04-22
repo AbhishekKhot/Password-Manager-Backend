@@ -7,8 +7,6 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
-    "migrate": "tsx src/migrate.ts",
-    "migrate:prod": "node dist/migrate.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
